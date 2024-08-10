@@ -1,0 +1,18 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" xsi="http://www.w3.org/2001/XMLSchema-instance" engine="UnityEngine.UIElements" editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../../../UIElementsSchema/UIElements.xsd" editor-extension-mode="False">
+    <ui:VisualElement name="BuildPackerWindow" style="height: auto; flex-shrink: 1; width: auto; max-width: none; max-height: none; display: flex; align-items: stretch; flex-grow: 1; justify-content: flex-start;">
+        <ui:TextField picking-mode="Ignore" label="Output Zip Name" name="OutputFileNameField" readonly="false" />
+        <ui:VisualElement style="flex-direction: row; flex-grow: 0; align-items: stretch; height: auto;">
+            <ui:TextField picking-mode="Ignore" label="Output Path" value="filler text" name="OutputPathField" readonly="true" style="display: flex; flex-grow: 1;" />
+            <ui:Button text="open file" display-tooltip-when-elided="true" name="OutputPathOpenFolderDialogueButton" />
+        </ui:VisualElement>
+        <ui:VisualElement style="flex-direction: row; flex-grow: 0; align-items: stretch; height: auto;">
+            <ui:TextField picking-mode="Ignore" label="Mock Backend Exe Path" value="filler text" name="MockBackendPathField" readonly="true" style="display: flex; flex-grow: 1;" />
+            <ui:Button text="open file" display-tooltip-when-elided="true" name="MockBackendExePathOpenFileDialogueButton" />
+        </ui:VisualElement>
+        <ui:DropdownField label="Jurisdiction" index="-1" choices="System.Collections.Generic.List`1[System.String]" name="JurisdictionDropdown" />
+        <ui:VisualElement style="flex-grow: 1; flex-shrink: 1; flex-basis: 1000px; justify-content: flex-end;">
+            <ui:Button text="Create Package" display-tooltip-when-elided="true" name="CreatePackageButton" style="justify-content: flex-end; align-items: stretch; position: relative; top: auto; bottom: auto; right: auto; left: auto; flex-grow: 0; overflow: visible; flex-basis: auto; flex-shrink: 1;" />
+            <ui:ProgressBar value="0" name="PackingProgressBar" high-value="2" style="display: none;" />
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

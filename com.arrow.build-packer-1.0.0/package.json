@@ -1,0 +1,9 @@
+{
+  "name": "com.arrow.build-packer",
+  "version": "1.0.0",
+  "displayName": "Arrow Build Packer",
+  "description": "This package combines the newest build and configured local mockbackend (including perms) into a single zip.",
+  "unity": "2021.3",
+  "keywords": [ "build" ],
+  "type": "library"
+}
