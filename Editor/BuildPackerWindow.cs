@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Collections.Concurrent;
 
+
 public class BuildPackerWindow : EditorWindow
 {
     private const string errorDialogueTitle = "PackageCreationError";

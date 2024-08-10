@@ -9,7 +9,7 @@
             <ui:TextField picking-mode="Ignore" label="Mock Backend Exe Path" value="filler text" name="MockBackendPathField" readonly="true" style="display: flex; flex-grow: 1;" />
             <ui:Button text="open file" display-tooltip-when-elided="true" name="MockBackendExePathOpenFileDialogueButton" />
         </ui:VisualElement>
-        <ui:DropdownField label="Jurisdiction" index="-1" choices="System.Collections.Generic.List`1[System.String]" name="JurisdictionDropdown" />
+        <ui:DropdownField label="Jurisdiction" index="-1" name="JurisdictionDropdown" />
         <ui:VisualElement style="flex-grow: 1; flex-shrink: 1; flex-basis: 1000px; justify-content: flex-end;">
             <ui:Button text="Create Package" display-tooltip-when-elided="true" name="CreatePackageButton" style="justify-content: flex-end; align-items: stretch; position: relative; top: auto; bottom: auto; right: auto; left: auto; flex-grow: 0; overflow: visible; flex-basis: auto; flex-shrink: 1;" />
             <ui:ProgressBar value="0" name="PackingProgressBar" high-value="2" style="display: none;" />

@@ -4,6 +4,10 @@
   "displayName": "Arrow Build Packer",
   "description": "This package combines the newest build and configured local mockbackend (including perms) into a single zip.",
   "unity": "2021.3",
+  "unityRelease": "32f1",
   "keywords": [ "build" ],
-  "type": "library"
+  "author": {
+	  "name": "Marvel Johnson",
+	  "email": "mjohnson@arrowinternational.com"
+  }
 }
