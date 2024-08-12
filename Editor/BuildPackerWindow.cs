@@ -24,9 +24,9 @@ public class BuildPackerWindow : EditorWindow
     private static string lastPackingStep;
     private static string ProjectPath => Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
     private static string buildFolderPath;
+    private static string productName;
     private static string cachedMockBackendJursidction;
-    private static ConcurrentBag<string> stepMessages = new();
-    private static ConcurrentBag<float> packagingProgressMessages = new();
+    private static ConcurrentStack<string> excludedJurisdictions = new();
     private static ConcurrentBag<ThreadEvent> threadEvents = new();
     private static object waitObj = new();
     private static bool waitingForMainThreadDialog;
@@ -41,6 +41,8 @@ public class BuildPackerWindow : EditorWindow
     private static TextField outputPathField;
     private static DropdownField jurisdictionDropdown;
     private static ProgressBar packingProgressBar;
+
+    #region Helper Classes
 
     private class Settings
     {
@@ -84,6 +86,8 @@ public class BuildPackerWindow : EditorWindow
         }
     }
 
+    #endregion
+
     [MenuItem("Build/Build Packer")]
     public static void ShowExample()
     {
@@ -93,22 +97,11 @@ public class BuildPackerWindow : EditorWindow
 
     private void Update()
     {
-        // Updates "Create Package" button text based on current step. Steps can update from other threads, this
-        // allows for Unity's API to be consumed "from" those threads without throwing exceptions.
-        if (stepMessages.Count > 0 && stepMessages.TryTake(out string step))
-        {
-            SetPackagingStep(step);
-        }
+        ProcessThreadEvents();
+    }
 
-        if (packagingProgressMessages.Count > 0 && packagingProgressMessages.TryTake(out float progress))
-        {
-            // Stops the progress bar from reaching the end before the packing process has completed.
-            // Depending on the project, it was possible for the progress bar to reach the end
-            // due to the things influencing it not reflecting the exact percentage of work they occupy.
-            if (packingProgressBar.value < packingProgressBar.highValue * 0.8f)
-                packingProgressBar.value += progress;
-        }
-
+    private void ProcessThreadEvents()
+    {
         if (threadEvents.TryTake(out ThreadEvent threadEvent))
         {
             switch (threadEvent.ArgType)
@@ -134,7 +127,7 @@ public class BuildPackerWindow : EditorWindow
 
                     break;
                 default:
-                    break;
+                    throw new Exception($"Invalid ThreadEvent!: {threadEvent.ArgType}");
             }
         }
     }
@@ -150,11 +143,12 @@ public class BuildPackerWindow : EditorWindow
 
         buildFolderPath = Path.Combine(Application.dataPath, "..", "Build");
         outputPathField.value = settings.outputZipPath;
+        productName = Application.productName;
 
         if (packing)
         {
             SetButtonStates(false);
-            stepMessages.Add(lastPackingStep);
+            threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, lastPackingStep));
         }
 
         RegisterToControlEvents(root);
@@ -173,7 +167,7 @@ public class BuildPackerWindow : EditorWindow
         try
         {
             SetProgressBarDisplay(DisplayStyle.Flex);
-            packagingProgressMessages.Add(0.1f);
+            threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 0.1f));
             string outputZipTempDirectory = Path.GetFileNameWithoutExtension(settings.outputZipPath);
 
             if (!Directory.Exists(outputZipTempDirectory))
@@ -188,19 +182,19 @@ public class BuildPackerWindow : EditorWindow
                 Directory.CreateDirectory(outputZipTempDirectory);
             }
 
-            packagingProgressMessages.Add(0.1f);
+            threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 0.1f));
             packing = true;
             SetButtonStates(false);
             await CopyPackageComponents(outputZipTempDirectory);
-            stepMessages.Add("Updating Mock Backend config...");
+            threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, "Updating Mock Backend config..."));
             CacheOriginalMockBackendJurisdiction();
             UpdateMockBackendConfig(settings.currentJurisdiction);
-            packagingProgressMessages.Add(0.3f);
+            threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 0.3f));
 
             await Task.Run(() =>
             {
                 CompressPackage(outputZipTempDirectory);
-                packagingProgressMessages.Add(0.5f);
+                threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 0.5f));
             });
 
             packingProgressBar.value = packingProgressBar.highValue;
@@ -224,9 +218,10 @@ public class BuildPackerWindow : EditorWindow
     private void ResetState()
     {
         packing = false;
-        stepMessages.Add(string.Empty);
+        SetPackagingStep(string.Empty);
         SetProgressBarDisplay(DisplayStyle.None);
         packingProgressBar.value = 0;
+        excludedJurisdictions.Clear();
         totalElementsToCompress = 0;
         threadEvents.Clear();
         SetButtonStates(true);
@@ -234,11 +229,12 @@ public class BuildPackerWindow : EditorWindow
 
     private void CompressPackage(string outputZipTempDirectory)
     {
-        stepMessages.Add("Creating zip...");
+        threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, "Creating zip..."));
+        string permsToExclude = excludedJurisdictions.Aggregate(string.Empty, (acc, currentJurisdiction) => acc += $"--exclude=\"{currentJurisdiction}\" ").TrimEnd(' ');
         using Process zipProc = Process.Start(new ProcessStartInfo()
         {
             FileName = "tar",
-            Arguments = $"-av -cf \"{settings.outputZipPath}\" --exclude {settings.outputZipPath} -C {Path.GetFullPath(Path.Combine(buildFolderPath, ".."))} Build -C {Path.GetFullPath(Path.Combine(settings.mockBackendFilePath, "..", ".."))} {Path.GetFileName(Path.GetFullPath(Path.Combine(settings.mockBackendFilePath, "..")))}",
+            Arguments = $"-av -cf \"{settings.outputZipPath}\" --exclude={settings.outputZipPath} {permsToExclude} -C {Path.GetFullPath(Path.Combine(buildFolderPath, ".."))} Build -C {Path.GetFullPath(Path.Combine(settings.mockBackendFilePath, "..", ".."))} {Path.GetFileName(Path.GetFullPath(Path.Combine(settings.mockBackendFilePath, "..")))}",
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -261,7 +257,7 @@ public class BuildPackerWindow : EditorWindow
             {
                 string relativeFilePath = e.Data.Split(' ')[1];
                 threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, $"compressed {Path.GetFileName(relativeFilePath)}"));
-                threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 1f / totalElementsToCompress));
+                threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 0.5f / totalElementsToCompress));
             }
             catch (Exception ex)
             {
@@ -274,10 +270,11 @@ public class BuildPackerWindow : EditorWindow
 
     private async Task CopyPackageComponents(string outputZipTempDirectory)
     {
-        stepMessages.Add("Tallying up files to compress..");
-        await Task.Run(() => PopulateCompressionMap(buildFolderPath));
-        await Task.Run(() => PopulateCompressionMap(MockBackendFolderPath));
-        packagingProgressMessages.Add(0.3f);
+        threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, "Tallying up files to compress.."));
+        Task buildCompressionMapPopulation = Task.Run(() => PopulateCompressionMap(buildFolderPath));
+        Task mockBackendCompressionMapPopulation = Task.Run(() => PopulateCompressionMap(MockBackendFolderPath));
+        await Task.Run(() => Task.WaitAll(buildCompressionMapPopulation, mockBackendCompressionMapPopulation));
+        threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 0.3f));
     }
 
     private void CacheOriginalMockBackendJurisdiction()
@@ -408,38 +405,26 @@ public class BuildPackerWindow : EditorWindow
     private async void PopulateCompressionMap(string currentDirectory)
     {
         totalElementsToCompress++;
-        stepMessages.Add($"mapping {Path.GetFileName(currentDirectory)} directory");
+        threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, $"mapping {Path.GetFileName(currentDirectory)} directory"));
 
         foreach (string file in Directory.EnumerateFiles(currentDirectory))
         {
             FileInfo fi = new FileInfo(file);
 
-            if ((fi.Attributes & FileAttributes.Compressed) == FileAttributes.Compressed)
+            if (fi.Extension == ".json" && IsPathAPartOfOtherPath(Path.Combine(MockBackendFolderPath, "PermFolder"), fi.FullName) && (!IsPathAPartOfOtherPath(Path.Combine(MockBackendFolderPath, "PermFolder", settings.currentJurisdiction), fi.FullName) || !fi.Name.Contains(productName)))
             {
-                bool dialogResponse = await CheckIfUserWantsToIncludeCompressedFile(fi.Name);
-
-                if (!dialogResponse)
-                    continue;
+                excludedJurisdictions.Push(fi.Name);
             }
 
-            stepMessages.Add($"mapping {fi.Name}");
+            threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, $"mapping {fi.Name}"));
             totalElementsToCompress++;
-            packagingProgressMessages.Add(0.001f);
+            threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 0.001f));
         }
 
         foreach (string directory in Directory.EnumerateDirectories(currentDirectory))
         {
             string fullDirectoryPath = Path.GetFullPath(directory);
             DirectoryInfo di = new DirectoryInfo(fullDirectoryPath);
-
-            if ((di.Attributes & FileAttributes.Compressed) == FileAttributes.Compressed)
-            {
-                bool dialogResponse = await CheckIfUserWantsToIncludeCompressedFile(di.Name);
-
-                if (!dialogResponse)
-                    continue;
-            }
-
             PopulateCompressionMap(directory);
         }
     }
