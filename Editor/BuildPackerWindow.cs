@@ -9,39 +9,79 @@ using System.Xml;
 using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Threading;
+using Arrow.MaxFusion.GameApi.Core;
 
 
 public class BuildPackerWindow : EditorWindow
 {
-    private const string errorDialogueTitle = "PackageCreationError";
+    private const string errorDialogueTitle = "Package Creation Error";
     private const string settingsSaveKey = "BuildPackerSaveKey";
     private static BuildPackerWindow wnd;
     private static bool packing;
-    private static string finalOutputPath = string.Empty;
     private static List<string> loadedMockBackendJurisdictions = new();
     private static string MockBackendFolderPath => Path.GetDirectoryName(settings.mockBackendFilePath);
     private static string lastPackingStep;
+    private static string ProjectPath => Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+    private static string buildFolderPath;
+    private static string cachedMockBackendJursidction;
     private static ConcurrentBag<string> stepMessages = new();
     private static ConcurrentBag<float> packagingProgressMessages = new();
-    private static string ProjectPath => Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+    private static ConcurrentBag<ThreadEvent> threadEvents = new();
+    private static object waitObj = new();
+    private static bool waitingForMainThreadDialog;
+    private static bool mainThreadDialogResponse;
+    private static int totalElementsToCompress;
     private static Settings settings;
 
-    private static DropdownField jurisdictionDropdown;
     private static Button mockBackendExePathOpenFileDialogueButton;
     private static Button outputPathOpenFolderDialogueButton;
     private static Button createPackageButton;
     private static TextField mockBackendPathField;
     private static TextField outputPathField;
-    private static TextField outputFileNameField;
+    private static DropdownField jurisdictionDropdown;
     private static ProgressBar packingProgressBar;
 
     private class Settings
     {
-        public string outputFileName = string.Empty;
-        public string outputFolderPath = string.Empty;
-        public string finalOutputPath = string.Empty;
+        public string outputZipPath = string.Empty;
         public string currentJurisdiction = string.Empty;
         public string mockBackendFilePath = string.Empty;
+    }
+
+    private class ThreadedDialogRequest
+    {
+        public string Title { get; private set; }
+        public string Body { get; private set; }
+        public string YesOption { get; private set; }
+        public string NoOption { get; private set; }
+
+        public ThreadedDialogRequest(string title, string body, string yesOption, string noOption)
+        {
+            Title = title;
+            Body = body;
+            YesOption = yesOption;
+            NoOption = noOption;
+        }
+    }
+
+    private enum ThreadArgType
+    {
+        Progress,
+        StepMessage,
+        DialogueRequest
+    }
+
+    private class ThreadEvent
+    {
+        public ThreadArgType ArgType { get; private set; }
+        public object Arg { get; private set; }
+
+        public ThreadEvent(ThreadArgType argType, object arg)
+        {
+            ArgType = argType;
+            Arg = arg;
+        }
     }
 
     [MenuItem("Build/Build Packer")]
@@ -68,6 +108,35 @@ public class BuildPackerWindow : EditorWindow
             if (packingProgressBar.value < packingProgressBar.highValue * 0.8f)
                 packingProgressBar.value += progress;
         }
+
+        if (threadEvents.TryTake(out ThreadEvent threadEvent))
+        {
+            switch (threadEvent.ArgType)
+            {
+                case ThreadArgType.Progress:
+                    packingProgressBar.value += (float)threadEvent.Arg;
+                    break;
+                case ThreadArgType.StepMessage:
+                    SetPackagingStep((string)threadEvent.Arg);
+                    break;
+                case ThreadArgType.DialogueRequest:
+                    ThreadedDialogRequest req = (ThreadedDialogRequest)threadEvent.Arg;
+
+                    if (string.IsNullOrEmpty(req.NoOption))
+                        mainThreadDialogResponse = EditorUtility.DisplayDialog(req.Title, req.Body, req.YesOption);
+                    else
+                        mainThreadDialogResponse = EditorUtility.DisplayDialog(req.Title, req.Body, req.YesOption, req.NoOption);
+
+                    lock (waitObj)
+                    {
+                        waitingForMainThreadDialog = false;
+                    }
+
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     public void CreateGUI()
@@ -79,7 +148,8 @@ public class BuildPackerWindow : EditorWindow
         InitializeControls(root);
         LoadCachedValues(root);
 
-        outputPathField.value = Path.Combine(settings.outputFolderPath, settings.outputFileName);
+        buildFolderPath = Path.Combine(Application.dataPath, "..", "Build");
+        outputPathField.value = settings.outputZipPath;
 
         if (packing)
         {
@@ -92,8 +162,7 @@ public class BuildPackerWindow : EditorWindow
 
     private void RegisterToControlEvents(VisualElement root)
     {
-        outputFileNameField.RegisterValueChangedCallback(OutputFileNameChangeHandler);
-        outputPathOpenFolderDialogueButton.clicked += OutputPathOpenFolderDialogueButtonHandler;
+        outputPathOpenFolderDialogueButton.clicked += OutputPathOpenFileDialogueButtonHandler;
         mockBackendExePathOpenFileDialogueButton.clicked += MockBackendExePathOpenFileDialogueButtonHandler;
         jurisdictionDropdown.RegisterValueChangedCallback(JurisdictionDropdownValueChangeHandler);
         root.Q<Button>("CreatePackageButton").clicked += CreatePackageButtonHandler;
@@ -104,33 +173,41 @@ public class BuildPackerWindow : EditorWindow
         try
         {
             SetProgressBarDisplay(DisplayStyle.Flex);
-            finalOutputPath = Path.GetFullPath(Path.Combine(settings.outputFolderPath, settings.outputFileName));
             packagingProgressMessages.Add(0.1f);
+            string outputZipTempDirectory = Path.GetFileNameWithoutExtension(settings.outputZipPath);
 
-            if (!Directory.Exists(finalOutputPath))
+            if (!Directory.Exists(outputZipTempDirectory))
             {
-                Directory.CreateDirectory(finalOutputPath);
+                if (IsPathAPartOfOtherPath(outputZipTempDirectory, ProjectPath))
+                {
+                    // Adding "~" to end of output path if it's inside of the project directory
+                    // to prevent Unity from importing the packed build, which generally causes issues.
+                    outputZipTempDirectory = $"{outputZipTempDirectory}~";
+                }
+
+                Directory.CreateDirectory(outputZipTempDirectory);
             }
 
             packagingProgressMessages.Add(0.1f);
             packing = true;
             SetButtonStates(false);
-            await CopyPackageComponents();
+            await CopyPackageComponents(outputZipTempDirectory);
             stepMessages.Add("Updating Mock Backend config...");
-            UpdateMockBackendConfig();
+            CacheOriginalMockBackendJurisdiction();
+            UpdateMockBackendConfig(settings.currentJurisdiction);
             packagingProgressMessages.Add(0.3f);
 
             await Task.Run(() =>
             {
-                CompressPackage();
+                CompressPackage(outputZipTempDirectory);
                 packagingProgressMessages.Add(0.5f);
-                CleanupTempArtifacts();
             });
 
             packingProgressBar.value = packingProgressBar.highValue;
+            UpdateMockBackendConfig(cachedMockBackendJursidction);
             EditorUtility.DisplayDialog("Build Packing Complete", "Completed build packing process!", "Ok");
             
-            using (Process.Start("explorer.exe", $"/select,\"{finalOutputPath}.zip\""))
+            using (Process.Start("explorer.exe", $"/select,\"{settings.outputZipPath}\""))
             {
                 SetProgressBarDisplay(DisplayStyle.None);
                 ResetState();
@@ -150,44 +227,72 @@ public class BuildPackerWindow : EditorWindow
         stepMessages.Add(string.Empty);
         SetProgressBarDisplay(DisplayStyle.None);
         packingProgressBar.value = 0;
+        totalElementsToCompress = 0;
+        threadEvents.Clear();
         SetButtonStates(true);
     }
 
-    private void CleanupTempArtifacts()
-    {
-        stepMessages.Add("Deleting temp files..");
-        Directory.Delete(finalOutputPath, true);
-    }
-
-    private void CompressPackage()
+    private void CompressPackage(string outputZipTempDirectory)
     {
         stepMessages.Add("Creating zip...");
         using Process zipProc = Process.Start(new ProcessStartInfo()
         {
             FileName = "tar",
-            Arguments = $"-a -cf \"{finalOutputPath}.zip\" -C \"{finalOutputPath}\" *",
+            Arguments = $"-av -cf \"{settings.outputZipPath}\" --exclude {settings.outputZipPath} -C {Path.GetFullPath(Path.Combine(buildFolderPath, ".."))} Build -C {Path.GetFullPath(Path.Combine(settings.mockBackendFilePath, "..", ".."))} {Path.GetFileName(Path.GetFullPath(Path.Combine(settings.mockBackendFilePath, "..")))}",
             CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
             WindowStyle = ProcessWindowStyle.Hidden
         });
 
+        zipProc.OutputDataReceived += RecievedTarDataHandler;
+        zipProc.ErrorDataReceived += RecievedTarDataHandler;
+        zipProc.BeginOutputReadLine();
+        zipProc.BeginErrorReadLine();
         zipProc.WaitForExit();
     }
 
-    private async Task CopyPackageComponents()
+    private void RecievedTarDataHandler(object sender, DataReceivedEventArgs e)
     {
-        string buildFolderPath = Path.Combine(Application.dataPath, "..", "Build");
-        stepMessages.Add("Copying build and Mock Backend..");
-        await Task.Run(() => CopyDirectory(buildFolderPath, finalOutputPath));
-        await Task.Run(() => CopyDirectory(MockBackendFolderPath, finalOutputPath));
+        if (e.Data != null)
+        {
+            try
+            {
+                string relativeFilePath = e.Data.Split(' ')[1];
+                threadEvents.Add(new ThreadEvent(ThreadArgType.StepMessage, $"compressed {Path.GetFileName(relativeFilePath)}"));
+                threadEvents.Add(new ThreadEvent(ThreadArgType.Progress, 1f / totalElementsToCompress));
+            }
+            catch (Exception ex)
+            {
+                threadEvents.Add(new ThreadEvent(ThreadArgType.DialogueRequest, new ThreadedDialogRequest(errorDialogueTitle, $"An error occurred while compressing files!\n\n{ex.Message}", "Ok", string.Empty)));
+                ResetState();
+                throw ex;
+            }
+        }
+    }
+
+    private async Task CopyPackageComponents(string outputZipTempDirectory)
+    {
+        stepMessages.Add("Tallying up files to compress..");
+        await Task.Run(() => PopulateCompressionMap(buildFolderPath));
+        await Task.Run(() => PopulateCompressionMap(MockBackendFolderPath));
         packagingProgressMessages.Add(0.3f);
     }
 
-    private void UpdateMockBackendConfig()
+    private void CacheOriginalMockBackendJurisdiction()
     {
         XmlDocument mockBackendConfig = new XmlDocument();
-        mockBackendConfig.Load(Path.Combine(finalOutputPath, Path.GetFileName(MockBackendFolderPath), "MockBackEnd.exe.config"));
-        mockBackendConfig.DocumentElement.SelectSingleNode("/configuration/userSettings/Arrow.MockBackend.Properties.Settings/setting[@name='jurisdiction']/value").InnerText = settings.currentJurisdiction;
-        mockBackendConfig.Save(Path.Combine(finalOutputPath, Path.GetFileName(MockBackendFolderPath), "MockBackEnd.exe.config"));
+        mockBackendConfig.Load(Path.Combine(MockBackendFolderPath, "MockBackEnd.exe.config"));
+        cachedMockBackendJursidction = mockBackendConfig.DocumentElement.SelectSingleNode("/configuration/userSettings/Arrow.MockBackend.Properties.Settings/setting[@name='jurisdiction']/value").InnerText;
+    }
+
+    private void UpdateMockBackendConfig(string jurisdiction)
+    {
+        XmlDocument mockBackendConfig = new XmlDocument();
+        mockBackendConfig.Load(Path.Combine(MockBackendFolderPath, "MockBackEnd.exe.config"));
+        mockBackendConfig.DocumentElement.SelectSingleNode("/configuration/userSettings/Arrow.MockBackend.Properties.Settings/setting[@name='jurisdiction']/value").InnerText = jurisdiction;
+        mockBackendConfig.Save(Path.Combine(MockBackendFolderPath, "MockBackEnd.exe.config"));
     }
 
     private void LoadCachedValues(VisualElement root)
@@ -201,11 +306,9 @@ public class BuildPackerWindow : EditorWindow
             settings = new Settings();
         }
 
-        outputFileNameField.value = settings.outputFileName;
-
-        if (!string.IsNullOrEmpty(settings.outputFolderPath))
+        if (!string.IsNullOrEmpty(settings.outputZipPath))
         {
-            root.Q<TextField>("OutputPathField").value = Path.GetFullPath($"{settings.outputFolderPath}{settings.outputFileName}");
+            root.Q<TextField>("OutputPathField").value = Path.GetFullPath(settings.outputZipPath);
         }
 
         if (!string.IsNullOrEmpty(settings.mockBackendFilePath))
@@ -226,7 +329,6 @@ public class BuildPackerWindow : EditorWindow
         mockBackendExePathOpenFileDialogueButton = root.Q<Button>("MockBackendExePathOpenFileDialogueButton");
         mockBackendPathField = root.Q<TextField>("MockBackendPathField");
         outputPathField = root.Q<TextField>("OutputPathField");
-        outputFileNameField = root.Q<TextField>("OutputFileNameField");
         outputPathOpenFolderDialogueButton = root.Q<Button>("OutputPathOpenFolderDialogueButton");
         createPackageButton = root.Q<Button>("CreatePackageButton");
         packingProgressBar = root.Q<ProgressBar>("PackingProgressBar");
@@ -244,7 +346,6 @@ public class BuildPackerWindow : EditorWindow
         mockBackendExePathOpenFileDialogueButton.SetEnabled(status);
         mockBackendPathField.SetEnabled(status);
         outputPathField.SetEnabled(status);
-        outputFileNameField.SetEnabled(status);
         outputPathOpenFolderDialogueButton.SetEnabled(status);
         createPackageButton.SetEnabled(status);
     }
@@ -284,7 +385,7 @@ public class BuildPackerWindow : EditorWindow
 
     private bool OutputFolderPathIsValid(string path)
     {
-        if (Directory.Exists(settings.outputFolderPath) && !EditorUtility.DisplayDialog("Output Folder Exists", "The path provided for the output folder already exists! Are you sure you want to override existing pack files?", "Yes", "No"))
+        if (File.Exists(settings.outputZipPath) && !EditorUtility.DisplayDialog("Output Folder Exists", "The path provided for the output folder already exists! Are you sure you want to override existing pack files?", "Yes", "No"))
         {
             return false;
         }
@@ -304,46 +405,76 @@ public class BuildPackerWindow : EditorWindow
         return false;
     }
 
-    private void CopyDirectory(string targetDirectoryPath, string outputDirectoryPath)
+    private async void PopulateCompressionMap(string currentDirectory)
     {
-        DirectoryInfo newDirectory = Directory.CreateDirectory(Path.Combine(outputDirectoryPath, Path.GetFileName(targetDirectoryPath)));
-        stepMessages.Add($"created {Path.GetFileName(targetDirectoryPath)} directory");
+        totalElementsToCompress++;
+        stepMessages.Add($"mapping {Path.GetFileName(currentDirectory)} directory");
 
-        foreach (string file in Directory.EnumerateFiles(targetDirectoryPath))
+        foreach (string file in Directory.EnumerateFiles(currentDirectory))
         {
             FileInfo fi = new FileInfo(file);
-            stepMessages.Add($"copying {fi.Name}");
-            File.Copy(fi.FullName, Path.Combine(newDirectory.FullName, fi.Name), true);
+
+            if ((fi.Attributes & FileAttributes.Compressed) == FileAttributes.Compressed)
+            {
+                bool dialogResponse = await CheckIfUserWantsToIncludeCompressedFile(fi.Name);
+
+                if (!dialogResponse)
+                    continue;
+            }
+
+            stepMessages.Add($"mapping {fi.Name}");
+            totalElementsToCompress++;
             packagingProgressMessages.Add(0.001f);
         }
 
-        foreach (string directory in Directory.EnumerateDirectories(targetDirectoryPath))
+        foreach (string directory in Directory.EnumerateDirectories(currentDirectory))
         {
             string fullDirectoryPath = Path.GetFullPath(directory);
+            DirectoryInfo di = new DirectoryInfo(fullDirectoryPath);
 
-            // Skipping directory if it matches finalOutputPath to avoid infinite recursion. This can happen if the user
-            // makes the output path somewhere inside of the build folder.
-            if (fullDirectoryPath == finalOutputPath)
-                continue;
+            if ((di.Attributes & FileAttributes.Compressed) == FileAttributes.Compressed)
+            {
+                bool dialogResponse = await CheckIfUserWantsToIncludeCompressedFile(di.Name);
 
-            CopyDirectory(directory, newDirectory.FullName);
+                if (!dialogResponse)
+                    continue;
+            }
+
+            PopulateCompressionMap(directory);
         }
+    }
+
+    private static async Task<bool> CheckIfUserWantsToIncludeCompressedFile(string fileName)
+    {
+        threadEvents.Add(
+                            new ThreadEvent(ThreadArgType.DialogueRequest,
+                                new ThreadedDialogRequest("\"Encountered Compressed File\"", $"Do you want to include {fileName} (from your project's build directory) in the final pack?", "Yes", "No")));
+
+        lock (waitObj)
+        {
+            waitingForMainThreadDialog = true;
+        }
+
+        return await Task.Run(() =>
+        {
+            while (true)
+            {
+                lock (waitObj)
+                {
+                    if (!waitingForMainThreadDialog)
+                    {
+                        break;
+                    }
+                }
+
+                Thread.Sleep(500);
+            }
+
+            return mainThreadDialogResponse;
+        });
     }
 
     #region EventHandlers
-
-    private void OutputFileNameChangeHandler(ChangeEvent<string> ev)
-    {
-        settings.outputFileName = ev.newValue;
-
-        if (!string.IsNullOrEmpty(settings.outputFolderPath))
-        {
-            outputPathField.value = Path.Combine(settings.outputFolderPath, settings.outputFileName);
-        }
-
-        PlayerPrefs.SetString(settingsSaveKey, JsonUtility.ToJson(settings));
-        PlayerPrefs.Save();
-    }
 
     private void MockBackendExePathOpenFileDialogueButtonHandler()
     {
@@ -364,14 +495,14 @@ public class BuildPackerWindow : EditorWindow
         {
             mockBackendPathField.value = settings.mockBackendFilePath;
             PopulateJurisdictionDropdown();
-            PlayerPrefs.SetString(settingsSaveKey, JsonUtility.ToJson(settings));
-            PlayerPrefs.Save();
+            Save();
         }
     }
 
-    private void OutputPathOpenFolderDialogueButtonHandler()
+    private void OutputPathOpenFileDialogueButtonHandler()
     {
-        string openedPath = EditorUtility.OpenFolderPanel("Output Folder Selection", settings.outputFolderPath, string.Empty);
+        string dialogueStartingDirectory = string.IsNullOrEmpty(settings.outputZipPath) ? $"{Application.productName}_BuildPack" : settings.outputZipPath;
+        string openedPath = EditorUtility.SaveFilePanel("Save Packed Zip", string.Empty, dialogueStartingDirectory, "zip");
 
         if (string.IsNullOrEmpty(openedPath))
         {
@@ -379,22 +510,19 @@ public class BuildPackerWindow : EditorWindow
         }
 
         openedPath = Path.GetFullPath(openedPath);
-
-        if (IsPathAPartOfOtherPath(ProjectPath, openedPath))
-        {
-            EditorUtility.DisplayDialog(errorDialogueTitle, "The output directory cannot be inside of the project directory! Please choose another path.", "Ok");
-            return;
-        }
-
-        settings.outputFolderPath = openedPath;
-        outputPathField.value = Path.Combine(settings.outputFolderPath, settings.outputFileName);
-        PlayerPrefs.SetString(settingsSaveKey, JsonUtility.ToJson(settings));
-        PlayerPrefs.Save();
+        settings.outputZipPath = openedPath;
+        outputPathField.value = settings.outputZipPath;
+        Save();
     }
 
     private void JurisdictionDropdownValueChangeHandler(ChangeEvent<string> ev)
     {
         settings.currentJurisdiction = ev.newValue;
+        Save();
+    }
+
+    private static void Save()
+    {
         PlayerPrefs.SetString(settingsSaveKey, JsonUtility.ToJson(settings));
         PlayerPrefs.Save();
     }
@@ -415,12 +543,6 @@ public class BuildPackerWindow : EditorWindow
             return false;
         }
 
-        if (!OutputFileNameIsValid())
-        {
-            EditorUtility.DisplayDialog(errorDialogueTitle, "Output File Path must have a value!", "Ok");
-            return false;
-        }
-
         if (!MockBackendPathIsValid(MockBackendFolderPath))
         {
             EditorUtility.DisplayDialog(errorDialogueTitle, "Mock Backend path is invalid! The MockBackend.exe file could not be found!", "Ok");
@@ -433,15 +555,13 @@ public class BuildPackerWindow : EditorWindow
             return false;
         }
 
-        if (!OutputFolderPathIsValid(settings.outputFolderPath))
+        if (!OutputFolderPathIsValid(settings.outputZipPath))
         {
             return false;
         }
 
         return true;
     }
-
-    private bool OutputFileNameIsValid() => !string.IsNullOrEmpty(settings.outputFileName);
 
     private bool IsPathAPartOfOtherPath(string path, string otherPath)
     {
